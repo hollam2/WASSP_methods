@@ -55,7 +55,7 @@ crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), "
 
 #create a list of the relevant 3D samples files to load
 file_list <- list.files(paste(path_samples, date,"/", reef, "/", sep=""), full.names = T) #read in the path for the data file
-file_list <- subset(file_list, grepl("processed", file_list)) #exclude unprocessed data
+file_list <- subset(file_list, grepl("processed", file_list) & !grepl("readme", file_list)) #exclude unprocessed data
 
 #load in the relevant pre-processed 3D samples from Step2 for a single survey - this step can be slow
 numextract <- function(string){str_extract(string, "\\-*\\d+\\.*\\d*")} #function for extracting number from string
@@ -86,7 +86,7 @@ df.reef <- as.data.frame(df.reef)
 Read in and manipulate bathymetry xyz data
 ```{r}
 bath.files <- list.files(paste(path_bath, sep=""), full.names = T)
-bath.files <- subset(bath.files, grepl(as.character(reef), bath.files) & grepl("base", bath.files)) 
+bath.files <- subset(bath.files, grepl(as.character(reef), bath.files) & grepl("base", bath.files) & !grepl("readme", bath.files)) 
 df.bath <- read.csv(bath.files[1])
 df.bath <- dplyr::rename(df.bath, Est = x, Nrt = y)
 

@@ -1,0 +1,1 @@
+This folder will contain the exported school thickness dataframe from the Step4 script.

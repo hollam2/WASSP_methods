@@ -1,0 +1,1 @@
+This folder contains the cruide track GPS coordinates for the example survey.

@@ -1,0 +1,1 @@
+This folder contains shapefiles of the coordinates of reef modules. 

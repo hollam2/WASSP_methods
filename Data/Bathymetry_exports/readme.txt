@@ -1,0 +1,1 @@
+This folder will contain the exported XYZ gridded bathymetry surface created by the Step1 script.

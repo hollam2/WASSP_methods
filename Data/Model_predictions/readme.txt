@@ -1,0 +1,1 @@
+This folder will contain exported images of the GAMM spatial predictions, semivariograms for residual autocorrelation and error distributions.

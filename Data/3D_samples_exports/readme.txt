@@ -1,0 +1,1 @@
+This folder and subfolders contain the exported georeferenced samples of midwater targets from Echoview.

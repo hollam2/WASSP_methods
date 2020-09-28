@@ -44,6 +44,8 @@ crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), "
 
 #load the pre-processed school thickness dataframes
 file_list <- list.files(path_data, full.names = TRUE)
+file_list <- subset(file_list, !grepl("readme", file_list))
+
 df=NULL
 for (file in file_list){
   x <- read.csv(file, header=TRUE, sep=",")
@@ -281,6 +283,7 @@ for(k_num in k_nums){
       
       #load the filenames of already fit models
       file_list <- list.files(paste(path_mods))
+      file_list <- subset(file_list, !grepl("readme", file_list))
       
       #ifelse to decide whether to fit a new model or read an existing one
       file_name <- paste("fit_tw_", "k=", k_num, ".rds", sep="")

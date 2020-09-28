@@ -65,7 +65,7 @@ df.bath <- raster(df.bath)
 #exclude the output files if this transect has already been processed or is not the transect of interest and read in and clean data
 numextract <- function(string){str_extract(string, "\\-*\\d+\\.*\\d*")} #function for extracting number from string
 ev.files <- list.files(paste(path_samples, date,"/", reef, "/", sep=""), full.names = T) #read in the path for the data file
-ev.files <- subset(ev.files, !grepl("processed", ev.files) & grepl(".zip", ev.files))
+ev.files <- subset(ev.files, !grepl("processed", ev.files) & grepl(".zip", ev.files) & !grepl("readme", ev.files))
 ```
 Loop over multiple transects, plot in 3D and output cleaned versions 
 ```{r}

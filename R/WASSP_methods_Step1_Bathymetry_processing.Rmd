@@ -43,6 +43,7 @@ Read in and manipulate bathymetry
 ```{r}
 #list the filenames of the relevant bathymetry xyz point clouds
 file_list <- list.files(paste(path_bath, reef, "/", sep=""), full.names=T)
+file_list <- subset(file_list, !grepl("readme", file_list))
 
 #read in the files and combine into a single dataframe - this step can be slow
 df.bath=NULL

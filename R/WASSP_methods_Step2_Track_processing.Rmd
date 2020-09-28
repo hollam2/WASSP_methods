@@ -50,7 +50,7 @@ df.reef <- read.csv(path_sites)
 
 #read in and tidy track data
 track.files <- list.files(paste(path_track, date,"/", reef, "/", sep=""), full.names = T)
-track.files <- subset(track.files, !grepl("processed", track.files)) #exclude the output files if this track has already been processed
+track.files <- subset(track.files, !grepl("processed", track.files) & !grepl("readme", track.files)) #exclude the output files if this track has already been processed
 df.tracks <- read.csv(track.files,header=TRUE,sep=",")
 df.tracks <- dplyr::rename(df.tracks, GPS_fix = 1)
 

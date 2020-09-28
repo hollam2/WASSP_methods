@@ -1,0 +1,1 @@
+This folder contains pre-processed school thickness dataframes for use in producing the GAMMs. 
