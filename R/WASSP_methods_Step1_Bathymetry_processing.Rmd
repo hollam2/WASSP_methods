@@ -1,0 +1,281 @@
+This script imports a set of bathymetry xyz point cloud data processed from the WASSP DataManager software for multiple surveys carried out at the same site. It rasterizes the seafloor returns into a surface using median values to reduce any impact of anomalously high values (sometimes caused by bubbles under the transducer) and uses ordinary kriging to fill any gaps or holes in the surface. 
+
+It then exports a base bathymetry xyz surface and goes on to import a series of coordinates for artificial objects on the seafloor. It incorporates the 3D outlines of these objects into the bathymetry surface for appropriate subsetting of midwater data.
+
+Required input files:
+
+-A set of xyz exported georeferenced seafloor returns from WASSP DataManager (or similar) contained within the directory path labeled "path_bath"
+-Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
+-A shapefile containing the GPS coordinates of artificial objects, contained within the directory labelled "path_shape"
+
+Created by: Matthew Holland
+Email: m.holland@unsw.edu.au
+Date: 22 Sept 2020
+```{r}
+#clear global environment
+rm(list = ls())
+
+#user inputs
+reef <- "JDN" #specify site name designation in the filename
+dist <- 300 #specify the width of the square survey extent in metres
+zone <- 56 #specify UTM grid zone for the site location
+hem <- "S" #specify hemisphere the survey was conducted in ("N" or "S")
+path_sites <- "../Data/Sites.csv" #specify the file directory path for the site coordinates
+path_bath <- "../Data/Bathymetry_point_clouds/" #specify the file directory path for the bathymetry xyz csv
+path_export <- "../Data/Bathymetry_exports/" #specify the file directory path for the exported school thickess for the survey
+path_shape <- "../Data/Reef_shapefiles" #path of the shapefile containing the reef module coordinates
+agg.cell <- 5 #specify primary grid cell size for environmental variable detection in m and for the resolution of the aggregated school thickness rasters
+res.cell <- 1 #specify resolution of high-resolution raster for rendering 3D outlines of artificial structures etc.
+```
+Load packages and relevant data
+```{r}
+#check if all required packages are installed. Install them if they are not present. Then load required packages
+list.of.packages <- c("sp", "dplyr", "raster", "ggplot2", "gstat", "rgdal")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+
+#define CRS for projection
+crs_longlat <- paste("+proj=longlat +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", sep="")
+crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", " +zone=", zone, sep="")
+```
+Read in and manipulate bathymetry
+```{r}
+#list the filenames of the relevant bathymetry xyz point clouds
+file_list <- list.files(paste(path_bath, reef, "/", sep=""), full.names=T)
+
+#read in the files and combine into a single dataframe - this step can be slow
+df.bath=NULL
+for (file in file_list){
+      x <- read.csv(file, header=FALSE, sep=",")
+      df.bath=rbind(df.bath,x)  
+      }
+
+#rename variables appropriately
+colnames(df.bath)[1:3] <- c("Long","Lat","z")
+
+#project xyz into UTM
+df.bath$Est <- df.bath$Long
+df.bath$Nrt <- df.bath$Lat
+coordinates(df.bath) <- ~ Est + Nrt
+proj4string(df.bath) <- CRS(crs_longlat)
+df.bath <- spTransform(df.bath, CRS(crs_utm))
+
+#read in reef coordinate data for determining range limits
+df.reef <- read.csv(file=path_sites)
+
+#convert reef centroid data to UTM for subsetting
+df.reef$Est <- df.reef$Longitude
+df.reef$Nrt <- df.reef$Latitude
+coordinates(df.reef) <- ~ Est + Nrt
+proj4string(df.reef) <- CRS(crs_longlat)
+df.reef <- spTransform(df.reef, CRS(crs_utm))
+df.reef <- as.data.frame(df.reef)
+
+#make reef origin for points
+df.bath$x <- df.bath$Est - df.reef$Est[df.reef$Code==reef]
+df.bath$y <- df.bath$Nrt - df.reef$Nrt[df.reef$Code==reef]
+
+#subset bathymetry xyz data to survey extent box
+buf <- 10 #define the number of buffer cells around each side of the survey extent
+df.bath <- subset(df.bath, abs(x) <= (dist/2)+buf*agg.cell & abs(y) <= dist/2++buf*agg.cell)
+
+#define raster
+r.base <- raster(ncols=dist/agg.cell+buf*2, nrows=dist/agg.cell+buf*2, xmn=(-1)*dist/2-agg.cell*buf, xmx=dist/2+agg.cell*buf, ymn=(-1)*dist/2-agg.cell*buf, ymx=dist/2+agg.cell*buf)
+
+#rasterise bathymetry
+df.bath <- as.data.frame(df.bath)
+coordinates(df.bath) <- ~ x + y
+r.bath <- rasterize(df.bath, r.base, field = df.bath$z, fun=function(x,...) {median(x, na.rm=T)}, update = TRUE)
+
+#remove any above 0 errors in the data
+r.bath[r.bath >= 0] <- NA
+
+#smooth the rasterised data with a focal function to reduce any anomalous values
+r.bath <- focal(r.bath, w=matrix(1, 3, 3), function(x) median(x, na.rm=TRUE))
+
+#plot the bathymetry raster 
+plot(r.bath)
+
+#convert to dataframe
+sub.rast <- as.data.frame(r.bath, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+sub.rast <- dplyr::rename(sub.rast, z = layer)
+
+#plot the results
+ggplot(sub.rast, aes(x,y,fill=z))+
+  geom_tile()+
+  coord_equal()+
+  theme_bw()+
+  scale_x_continuous(expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  scale_fill_gradientn(colours = terrain.colors(10))
+```
+Use ordinary kriging to interpolate over any missing data (holes) in bathymetry raster
+```{r}
+krig.bath <- subset(sub.rast, !(is.na(sub.rast$z)))
+krig.bath <- krig.bath[sample(nrow(krig.bath), nrow(krig.bath/2)), ]
+
+#define coordinates
+coordinates(krig.bath) <- ~ x + y
+
+#create variogram model
+lzn.vgm <- variogram(z~1, data=krig.bath, cutoff=100) # calculates sample variogram values 
+lzn.fit <- fit.variogram(lzn.vgm, vgm(c( "Exp", "Sph", "Gau", "Mat"))) # fit model
+
+#plot variogram model
+plot(lzn.vgm, lzn.fit) # plot the sample values, along with the fit model
+
+#create empty raster dataframe
+krig.grid <- as.data.frame(r.base, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+
+#define coordinates
+coordinates(krig.grid) <- ~ x + y
+
+#krig into empty raster dataframe
+lzn.kriged <- as.data.frame(krige(z ~ 1, krig.bath, krig.grid, model=lzn.fit, maxdist=20))
+
+#matching kriged pixels to original bathy data
+krig.cells <- subset(sub.rast, (is.na(sub.rast$z)))
+sub.rast <- subset(sub.rast, !(is.na(sub.rast$z)))
+
+#unique matching variables
+krig.cells <- within(krig.cells, Uniq.ID <- paste(x, y, sep=','))
+lzn.kriged <- within(lzn.kriged, Uniq.ID <- paste(x, y, sep=','))
+sub.rast <- within(sub.rast, Uniq.ID <- paste(x, y, sep=','))
+
+#match NA cells with kriged data
+krig.cells$z <- lzn.kriged$var1.pred[match(krig.cells$Uniq.ID, lzn.kriged$Uniq.ID)]
+
+#bind dataframes to replace missing data
+sub.rast <- rbind(sub.rast, krig.cells)
+
+#plot the results of filling the holes in the data
+ggplot(sub.rast, aes(x,y,fill=z))+
+  geom_tile()+
+  coord_equal()+
+  theme_bw()+
+  scale_x_continuous(expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  scale_fill_gradientn(colours = terrain.colors(10))
+```
+Create export file for base bathymetry XYZ surface and save file
+```{r}
+#create new dataframe
+df.export <- sub.rast
+
+#convert coordinate system back to UTM
+df.export$x <- df.export$x + df.reef$Est[df.reef$Code==reef]
+df.export$y <- df.export$y + df.reef$Nrt[df.reef$Code==reef]
+
+#keep only three columns (xyz)
+df.export <- dplyr::select(df.export, c("x", "y", "z"))
+
+#Save .csv file of unmodified bathymetry (no added 3D structures) for use in the Step4 script
+write.csv(df.export, paste(path_export, reef, "-base", ".csv", sep=""), row.names = F)
+```
+Create modified bathymetry surface containing 3D shapes of structures for subsetting in Echoview. This step may not always be necessary. 
+```{r}
+#replace bathymetry raster with kriged version (holes filled)
+coordinates(df.export) <- ~ x + y
+gridded(df.export) <- TRUE
+r.bath <- raster(df.export)
+df.export <- as.data.frame(df.export)
+
+#disaggregate raster so that structure outlines can be resolved in higher resolution 
+r.bath.disagg <- disaggregate(r.bath, fact=agg.cell/res.cell, method="bilinear")
+
+#enter reef module dimensions
+wide <- 4 #module width (assuming square)
+high <- 5 #module height
+bot.dep <- -30 #bottom depth
+top.ind <- 1.25 #top indentation
+top.wid <- 2 #top width
+ant <- 3.5 #antenna height
+ant.wid <- 0.25 #antenna width
+res <- 0.25 #resolution of raster
+cnr <- (wide-top.ind)/2 #corner indentation
+
+#read shapefile of reef module coordinates
+df.outlines <- as.data.frame(readOGR(dsn=path_shape,layer="Actual_Modules_GDA94_Z56"))
+df.outlines <- subset(df.outlines, Set == "North Set")
+
+#calculate boundaries of the reef modules
+top <- df.outlines$Pos_Northi + 0.5*wide
+bottom <- df.outlines$Pos_Northi - 0.5*wide
+left <- df.outlines$Pos_Eastin - 0.5*wide
+right <- df.outlines$Pos_Eastin + 0.5*wide
+
+#combine these outlines into a dataframe
+df.outlines <- data.frame(top=top, bottom=bottom, left=left, right=right, Est.mid=df.outlines$Pos_Eastin , Nrt.mid=df.outlines$Pos_Northi, tow=df.outlines$Tower)
+
+#create empty base raster to fill with new updated bathymetry, including modules
+grid <- as.data.frame(r.bath.disagg, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+grid <- dplyr::rename(grid, Est=x, Nrt=y)
+
+#create initial shape of reefs from shape bounds
+for(i in 1:nrow(df.outlines)){
+  grid$z <- ifelse(grid$Est >= df.outlines$left[i] & grid$Est <= df.outlines$right[i] &
+                     grid$Nrt >= df.outlines$bottom[i] & grid$Nrt <= df.outlines$top[i],
+                   grid$z + high, 
+                   grid$z)
+}
+
+
+#create towers
+for(i in 1:nrow(df.outlines)){
+  grid$z <- ifelse(abs(grid$Est - df.outlines$Est.mid[i]) < ant.wid & abs(grid$Nrt - df.outlines$Nrt.mid[i]) < ant.wid & df.outlines$tow[i] == "Yes",
+                   grid$z + ant + top.ind, 
+                   grid$z)
+}
+```
+Make DEM
+```{r}
+dem <- data.frame(x=grid$Est, y=grid$Nrt, z=grid$z)
+r.dem <- reshape2::acast(dem, x~y, value.var="z")
+
+#4D plotting function
+levelpersp <- function(x, y, z, colors=terrain.colors, ...) {
+  ## getting the value of the midpoint
+  zz <- (z[-1,-1] + z[-1,-ncol(z)] + z[-nrow(z),-1] + z[-nrow(z),-ncol(z)])/4
+  ## calculating the breaks
+  breaks <- hist(zz, plot=FALSE)$breaks
+  ## cutting up zz
+  cols <- colors(length(breaks)-1)
+  zzz <- cut(zz, breaks=breaks, labels=cols)
+  ## plotting
+  persp(x, y, z, col=as.character(zzz), ...)
+  ## return breaks and colors for the legend
+  list(breaks=breaks, colors=cols)
+}
+
+#calculate reduction factor for z axis to keep coordinates equal
+rdctn <- (abs(abs(min(dem$z, na.rm=T)) - abs(max(dem$z, na.rm=T)))) / (2*dist)
+
+#specift a multiplier for z-axis (default is 1 for real scale)
+mltp <- 2
+
+#3D plot for visualising the result
+levelpersp(sort(unique(grid$Est)), sort(unique(grid$Nrt)), r.dem,  border=NA, phi=25, theta=135, shade=0.15, expand=rdctn*mltp, axes=TRUE, ticktype="detailed", nticks=2)
+```
+Save updated bathymetry for subsetting in Echoview and R
+```{r}
+#rename variables for xyz format
+df.export2 <- dplyr::rename(grid, x = Est, y = Nrt)
+
+#Save .csv file as UTM
+write.csv(df.export2, paste(path_export, reef, "-modified", "-UTM", ".csv", sep=""), row.names = F)
+
+#Save .csv file as longlat for use as a boundary in Echoview
+coordinates(df.export2) <- ~ x + y
+proj4string(df.export2) <- CRS(crs_utm)
+gridded(df.export2) <- TRUE
+df.export2 <- raster(df.export2)
+df.export2 <- projectRaster(df.export2, crs=CRS(crs_longlat))
+df.export2 <- as.data.frame(df.export2, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+df.export2 <- data.frame(Latitude=df.export2$y, Longitude=df.export2$x, Depth=abs(df.export2$z))
+write.csv(df.export2, paste(path_export, reef, "-modified", "-longlat", ".csv", sep=""), row.names = F)
+```
+
+```
+
+

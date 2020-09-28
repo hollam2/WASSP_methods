@@ -1,0 +1,408 @@
+This script is used for generating a spatial model (GAMM) to map the mean distribution of school thickness around an artificial reef.
+
+Required input files:
+
+-A set of processed school thickness dataframes for multiple surveys of the same site, from Step4 script, contained within the directory path labeled "path_data" 
+-Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
+-Site bathymetry gridded xyz data for the site in csv format, from Step1 script, contained within the directory path labeled "path_bath"
+-A shapefile containing the GPS coordinates of artificial objects, contained within the directory labelled "path_shape"
+
+Created by: Matthew Holland
+Email: m.holland@unsw.edu.au
+Date: 18 Sept 2020
+```{r}
+#clear global environment
+rm(list = ls())
+
+#user inputs
+reef <- "JDN"
+dist <- 300 #specify the width of the square survey extent in metres
+agg.cell <- 5 #specify primary grid cell size for aggregated school thickness rasters
+zone <- 56 #specify UTM grid zone for the site location
+hem <- "S" #specify hemisphere the survey was conducted in ("N" or "S")
+path_data <- "../Data/School_thickness_pre-processed/" #specify the file directory path for the 3D samples
+path_sites <- "../Data/Sites.csv" #specify the file directory path for the site coordinates
+path_bath <- "../Data/Bathymetry_exports/" #specify the file directory path for the bathymetry xyz csv
+path_shape <- "../Data/Reef_shapefiles" #path of the shapefile containing the reef module coordinates
+path_mods <- "../Data/Models/" #path of the folder for exporting the fitted models, or loading saved models if they have already been fitted
+path_preds <- "../Data/Model_predictions/" #path of the folder for exporting the model spatial prediction outputs
+```
+Load packages and relevant data
+```{r}
+#check if all required packages are installed. Install them if they are not present. Then load required packages
+list.of.packages <- c("ggplot2", "sp", "dplyr", "rgdal", "raster", "mgcv", "gamm4", "metR", "gstat", "grid")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+
+#turn off scientific notation
+options(scipen=999)
+
+#define CRS for projection
+crs_longlat <- paste("+proj=longlat +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", sep="")
+crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", " +zone=", zone, sep="")
+
+#load the pre-processed school thickness dataframes
+file_list <- list.files(path_data, full.names = TRUE)
+df=NULL
+for (file in file_list){
+  x <- read.csv(file, header=TRUE, sep=",")
+  df=rbind(df,x)  
+}
+rm(x)
+
+#create factor for date
+dates <- strsplit(as.character(df$date), "-")
+dates <- data.frame(matrix(unlist(dates), nrow=length(dates), byrow=T))
+df$date <- as.factor(paste(dates$X3, dates$X2, dates$X1, sep="-"))
+
+#define colour palette
+jetcols <- c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000")
+
+#plot one survey of data initially to visually inspect
+ggplot(df, aes(x,y,fill=vol))+
+  geom_tile()+
+  scale_fill_gradientn(colours=jetcols)+
+  coord_equal()+
+  theme_bw()+
+  facet_wrap(~ date)+
+  scale_y_continuous(expand=c(0,0))+
+  scale_x_continuous(expand=c(0,0))
+```
+Import reef location
+```{r}
+#import reef centre waypoint and project
+df.reef <- read.csv(path_sites)
+
+#convert reef centroid data to UTM for subsetting
+df.reef$Est <- df.reef$Longitude
+df.reef$Nrt <- df.reef$Latitude
+coordinates(df.reef) <- ~ Est + Nrt
+proj4string(df.reef) <- CRS(crs_longlat)
+df.reef <- spTransform(df.reef, CRS(crs_utm))
+df.reef <- as.data.frame(df.reef)
+```
+Aggregate transects for easier modelling
+```{r}
+#unique factor for each transect
+df$transID <- paste(df$date, df$trans, sep="-")
+
+#aggregation cutting function
+midcut<-function(x,from,to,by){
+   ## cut the data into bins...
+   x=cut(x,seq(from,to,by),include.lowest=T)
+   ## make a named vector of the midpoints, names=binnames
+   vec=seq(from+by/2,to-by/2,by)
+   names(vec)=levels(x)
+   ## use the vector to map the names of the bins to the midpoint values
+   unname(vec[x])
+}
+
+df$xagg <- midcut(df$x, (-1)*dist/2, dist/2, agg.cell)
+df$yagg <- midcut(df$y, (-1)*dist/2, dist/2, agg.cell)
+
+#aggregate data by calculating the mean across each set of cells
+df <- df %>%
+  group_by(trans, date, xagg, yagg) %>%
+  summarise(vol = mean(vol, na.rm=T),
+            min = mean(min, na.rm=T),
+            max = mean(max, na.rm=T))
+
+#rename mean coordinate addresses
+df <- dplyr::rename(df, x = xagg, y = yagg)
+
+#reference spatial data as UTM
+df$Est <- df$x + df.reef$Est[df.reef$Code==reef]
+df$Nrt <- df$y + df.reef$Nrt[df.reef$Code==reef]
+
+#plot data initially
+ggplot(df, aes(x,y,fill=vol))+
+  geom_tile()+
+  scale_fill_gradientn(colours=jetcols)+
+  coord_equal()+
+  theme_bw()+
+  facet_wrap(~ date)+
+  scale_y_continuous(expand=c(0,0))+
+  scale_x_continuous(expand=c(0,0))
+```
+Read in the locations of reef modules from a shapefile
+```{r}
+#read shapefile of reef module coordinates
+df.outlines <- as.data.frame(readOGR(dsn=path_shape,layer="Actual_Modules_GDA94_Z56"))
+df.outlines <- subset(df.outlines, Set == "North Set")
+df.outlines <- as.data.frame(df.outlines)
+
+#set the radius for the reef modules
+radius <- 4/2 #radius in meters
+
+# define the plot edges based upon the plot radius. 
+yPlus <- df.outlines$Pos_Northi+radius
+xPlus <- df.outlines$Pos_Eastin+radius
+yMinus <- df.outlines$Pos_Northi-radius
+xMinus <- df.outlines$Pos_Eastin-radius
+
+# calculate polygon coordinates for each plot centroid. 
+square=cbind(xMinus,yPlus,  # NW corner
+    xPlus, yPlus,  # NE corner
+    xPlus,yMinus,  # SE corner
+    xMinus,yMinus, # SW corner
+    xMinus,yPlus)  # NW corner again - close ploygon
+
+# Extract the plot ID information
+ID=df.outlines$Reef_Numbe
+
+# First, initialize a list that will later be populated
+# a, as a placeholder, since this is temporary
+a <- vector('list', length(2))
+
+# loop through each centroid value and create a polygon
+# this is where we match the ID to the new plot coordinates
+for (i in 1:nrow(df.outlines)) {  # for each for in object centroids
+      a[[i]]<-Polygons(list(Polygon(matrix(square[i, ], ncol=2, byrow=TRUE))), ID[i]) 
+      # make it an Polygon object with the Plot_ID from object ID
+    }
+
+# convert a to SpatialPolygon and assign CRS
+polysB<-SpatialPolygons(a,proj4string=CRS(crs_utm))
+polysB.df <- fortify(polysB)
+
+#centre coordinates on the reef
+polysB.df <- dplyr::rename(polysB.df, Est = long, Nrt = lat)
+polysB.df$x <- polysB.df$Est - df.reef$Est[df.reef$Code==reef]
+polysB.df$y <- polysB.df$Nrt - df.reef$Nrt[df.reef$Code==reef]
+
+#plot data initially
+ggplot(df, aes(x,y,fill=vol))+
+  geom_tile()+
+  scale_fill_gradientn(colours=jetcols)+
+  geom_polygon(data=polysB.df, aes(x=x, y=y, group=id), inherit.aes = F, colour="white")+
+  coord_equal()+
+  facet_wrap(~ date)+
+  theme_bw()+
+  scale_y_continuous(expand=c(0,0))+
+  scale_x_continuous(expand=c(0,0))
+```
+Calculate distance from module surfaces to spatially constrain the data used in model fitting
+```{r}
+#create base raster grid
+buf <- 10 #define the number of buffer cells around each side of the survey extent
+df.rast <- raster(ncols=dist/agg.cell+buf*2, nrows=dist/agg.cell+buf*2, xmn=(-1)*dist/2-agg.cell*buf, xmx=dist/2+agg.cell*buf, ymn=(-1)*dist/2-agg.cell*buf, ymx=dist/2+agg.cell*buf)
+
+#define coordinates for module outlines
+coordinates(polysB.df) <- ~x + y
+jdn.dist <- distanceFromPoints(df.rast, polysB.df)
+polysB.df <- as.data.frame(polysB.df)
+
+#plot the distance surface
+plot(jdn.dist)
+
+#create variables for distance from modules
+jdn.dist.df <- as.data.frame(jdn.dist, row.names=NULL, optional=FALSE, xy=TRUE, 
+                        na.rm=FALSE, long=FALSE)
+
+df$dist <- jdn.dist.df$layer[match(paste(df$x, df$y),paste(jdn.dist.df$x, jdn.dist.df$y))]
+```
+Create prediction dataframe
+```{r}
+df.pred <- as.data.frame(jdn.dist, row.names=NULL, optional=FALSE, xy=TRUE, 
+                        na.rm=FALSE, long=FALSE)
+df.pred <- dplyr::rename(df.pred, dist = layer)
+```
+Calculate mean school volume across reef field from the five surveys
+```{r}
+df_mean <- df %>%
+            filter(dist <= 70) %>%
+            group_by(x, y) %>%
+            summarise(vol_mean = mean(vol, na.rm=T))
+
+#theme for ggplot
+font_size <- 16
+
+#ggplot theme
+eff_theme <- theme(plot.title = element_text(color = "black", size = font_size, angle = 0, hjust = 0.5),
+             axis.text.x = element_text(color = "black", size = font_size, angle = 0, hjust = .5, vjust = .5, face = "plain"),
+             axis.text.y = element_text(color = "black", size = font_size, angle = 0, hjust = 1, vjust = 0.5, face = "plain"),  
+             axis.title.x = element_text(color = "black", size = font_size, angle = 0, hjust = .5, vjust = 0, face = "plain"),
+             axis.title.y = element_text(color = "black", size = font_size, angle = 90, hjust = .5, vjust = .5, face = "plain"),
+             legend.title = element_text(color = "black", size = font_size, angle = 0, face = "plain"),
+             legend.text = element_text(color = "black", size = font_size, angle = 0, face = "plain"),
+             strip.text.x = element_text(size = font_size, colour = "black", angle = 0),
+             plot.margin=unit(c(0.5,0.7,0.5,0.5),"cm"))
+
+      #plot the mean volume results to examine
+      ggplot()+
+      geom_tile(data=df_mean, aes(x=x,y=y,fill=vol_mean))+
+      geom_polygon(data=polysB.df, aes(x=x, y=y, group=id), inherit.aes = F, colour="white")+
+      scale_fill_gradientn(colours=jetcols, name="School\nthickness (m)", breaks=seq(0,20,2), limits=c(0, 10.5))+
+      coord_equal()+
+      scale_x_continuous(expand=c(0,0), name="x (m)")+
+      scale_y_continuous(expand=c(0,0), name="y (m)")+
+      theme_bw()+
+      eff_theme+
+      theme(legend.position="bottom")+
+      ggtitle(paste("Mean volume"))
+```
+Attempt Tweedie GAMMs to model school thickness around the artificial reef
+This script will look for saved 
+```{r}
+#specify a set of k-value parameters to test for the GAMM
+k_nums <- c(5, 10, 25, 50, 75, 100)
+
+for(k_num in k_nums){
+
+      #model parameters
+      distance <- 70 #specify max distance from the nearest module to be considered in this model
+      
+      #FIT A MODEL WITHOUT RANDOM EFFECTS TO EXTRACT P-PARAMETER FOR TWEEDIE
+      
+      #define the variables
+      yvar <- 'vol'
+      xvars <- "s(x,y,k=k_num)"
+      
+      #define the random effects
+      r.eff <- '(1|date)'
+      r.eff.form <- as.formula(paste('~', paste( r.eff, collapse=' + ' ) ))
+      
+      #combine into model formula
+      my.formula <- as.formula(paste( yvar, '~', paste( xvars, collapse=' + ' ) ) )
+      
+      #fit the first gam without random effects to extract p-parameter
+      fit_tw_nr <- gam(my.formula, family=tw(), data=subset(df, dist <= distance))
+      
+      #extract p-parameter for GAMM
+      p.par <- summary(fit_tw_nr)
+      p.par<-gsub("\\).*","", as.character(p.par[11]))
+      p.par<-as.numeric(sub('.*\\(p=', '', p.par))
+  
+      #examine the gam
+      gam.check(fit_tw_nr)
+      summary(fit_tw_nr)
+      plot(fit_tw_nr)
+      
+      #load the filenames of already fit models
+      file_list <- list.files(paste(path_mods))
+      
+      #ifelse to decide whether to fit a new model or read an existing one
+      file_name <- paste("fit_tw_", "k=", k_num, ".rds", sep="")
+      ifelse(file_name %in% file_list, 
+             fit_tw <- readRDS(file=paste(path_mods, file_name, sep="")),
+             fit_tw <- gamm4(my.formula, random=r.eff.form, family=Tweedie(link="log", p=p.par), data=subset(df, dist <= distance)))
+      
+      #examine the GAMM
+      plot(fit_tw$gam)
+      gam.check(fit_tw$gam)
+      summary(fit_tw$gam)
+
+      #save the model if it is not already saved
+      if(file_name %in% file_list == FALSE){
+        saveRDS(fit_tw, file=paste(path_mods, file_name, sep=""))
+                }
+      
+      #generate prediction surface
+      preds <- predict(fit_tw$gam, df.pred, se.fit=T)
+      df.pred$fit_tw <- as.numeric(preds$fit)
+      df.pred$fit_tw_se <- as.numeric(preds$se.fit)
+      df.pred$fit_tw <- fit_tw$gam$family$linkinv(df.pred$fit_tw)
+
+      #limit the upper prediction based on the max value of the original data
+      df.pred$fit_tw[df.pred$fit_tw >= max(subset(df, dist <= distance)["vol"])] <- max(subset(df, dist <= distance)["vol"])
+      
+      #determine fill scale limits
+      fill.range <- df.pred %>%
+          filter(dist <= distance) %>%
+          summarise(mn = min(fit_tw),
+                    mx = max(fit_tw))
+      
+      #contour breaks
+      bks <- c(0.5, 1, 2, 3, 4, 5, 6, 7)
+      
+      #decide axis limits
+      lims <- subset(df.pred, dist <= distance)
+      
+      #theme for ggplot
+      font_size <- 16
+      eff_theme <- theme(plot.title = element_text(color = "black", size = font_size, angle = 0, hjust = 0.5),
+              axis.text.x = element_text(color = "black", size = font_size, angle = 0, hjust = .5, vjust = .5, face = "plain"),
+              axis.text.y = element_text(color = "black", size = font_size, angle = 0, hjust = 1, vjust = 0.5, face = "plain"),  
+              axis.title.x = element_text(color = "black", size = font_size, angle = 0, hjust = .5, vjust = 0, face = "plain"),
+              axis.title.y = element_text(color = "black", size = font_size, angle = 90, hjust = .5, vjust = .5, face = "plain"),
+              legend.title = element_text(color = "black", size = font_size, angle = 0, face = "plain"),
+              legend.text = element_text(color = "black", size = font_size, angle = 0, face = "plain"),
+              strip.text.x = element_text(size = font_size, colour = "black", angle = 0),
+              plot.margin=unit(c(0.5,0.7,0.5,0.5),"cm"))
+
+      #plot the results
+      #plot the preliminary results to examine
+      tw_pred <- ggplot()+
+                  geom_tile(data=subset(df.pred, dist <= distance), aes(x=x,y=y,fill=fit_tw))+
+                  geom_polygon(data=polysB.df, aes(x=x, y=y, group=id), inherit.aes = F, colour="white")+
+                  scale_fill_gradientn(colours=jetcols, name="School\nthickness (m)", limits=c(0,6.7), breaks=seq(0,20,1))+
+                  geom_contour(data=df.pred, aes(x=x,y=y, z=fit_tw), breaks=bks, colour="white", inherit.aes = F)+
+                  geom_text_contour(data=df.pred, aes(x=x,y=y, z=fit_tw), breaks=bks, colour="white", inherit.aes = F, size=4.5)+
+                  ggtitle(paste("k=", k_num, sep=""))+
+                  coord_equal()+
+                  scale_x_continuous(expand=c(0,0), name="x (m)", limits=c(min(lims$x),max(lims$x)))+
+                  scale_y_continuous(expand=c(0,0), name="y (m)", limits=c(min(lims$y),max(lims$y)))+
+                  theme_bw()+
+                  eff_theme+
+                  theme(legend.position="bottom")
+      
+      #save plot as .png file
+      Filename <- "tw_pred"
+      ggsave(tw_pred, filename=paste("../Data/Model_predictions/", Filename, "_k=", k_num, ".png", sep=""), dpi=1000, height=18, width=18, units="cm")
+      tw_pred
+      
+      #contour breaks
+      bks <- seq(1, 3, 0.2)
+      bks2 <- seq(1, 3, 0.5)
+
+      #plot the standard error of the prediction
+            tw_pred_se <- ggplot()+
+                  geom_tile(data=subset(df.pred, dist <= distance), aes(x=x,y=y,fill=fit_tw_se))+
+                  geom_polygon(data=polysB.df, aes(x=x, y=y, group=id), inherit.aes = F, colour="white")+
+                  scale_fill_gradientn(colours=jetcols, name="Standard\nerror (m)", limits=c(0,6.7), breaks=seq(0,20,1))+
+                  geom_contour(data=df.pred, aes(x=x,y=y, z=fit_tw_se), breaks=bks, colour="white", inherit.aes = F)+
+                  geom_text_contour(data=df.pred, aes(x=x,y=y, z=fit_tw_se), breaks=bks, colour="white", inherit.aes = F, size=4.5)+
+                  ggtitle(paste("k=", k_num, sep=""))+
+                  coord_equal()+
+                  scale_x_continuous(expand=c(0,0), name="x (m)", limits=c(min(lims$x),max(lims$x)))+
+                  scale_y_continuous(expand=c(0,0), name="y (m)", limits=c(min(lims$y),max(lims$y)))+
+                  theme_bw()+
+                  eff_theme+
+                  theme(legend.position="bottom")
+      
+      #save plot as .png file
+      Filename <- "tw_pred_se"
+      ggsave(tw_pred_se, filename=paste("../Data/Model_predictions/", Filename, "_k=", k_num, ".png", sep=""), dpi=1000, height=18, width=18, units="cm")
+      tw_pred_se
+  
+      #examine variogram for spatial autocorrelation
+      df.xy <- subset(df, dist <= distance)
+      coordinates(df.xy) <- ~ x + y
+      
+      nat.vgm <- gstat::variogram(residuals(fit_tw$gam, type="pearson")~1, data=df.xy)
+      plot(nat.vgm, xlab="Distance (m)", ylab="Semivariance", main=paste("k=", k_num, sep=""), ylim=c(0,12))
+      
+      Filename <- "mod_vario"
+      dev.new()
+      png(filename=paste(path_preds, Filename, "_k=", k_num, ".png", sep=""), width = 10, height = 10, units="cm", res = 600)
+      print(plot(nat.vgm, xlab="Distance (m)", ylab="Semivariance", main=paste("k=", k_num, sep=""), ylim=c(0,12)))
+      dev.off()
+      
+}
+```
+Calculate a few figures based on the distribution of volume
+```{r}
+#calculate the total volume of the prediction
+df.pred_s <- subset(df.pred, dist <= distance)
+
+#calculate the proportion of volume occurring with 50 m of a module
+sum(df.pred_s$fit_tw[df.pred_s$dist <= 50]) / sum(df.pred_s$fit_tw)
+
+#calculate the mean height at the max distance from modules
+mean(df.pred_s$fit_tw[df.pred_s$dist <= 5])
+mean(df.pred_s$fit_tw[df.pred_s$dist >= distance - 5])
+
+#mimimum predicted value
+range(df.pred_s$fit_tw)
+```

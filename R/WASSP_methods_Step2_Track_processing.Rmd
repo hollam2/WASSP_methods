@@ -1,0 +1,133 @@
+This script imports a set of cruise track GPS waypoints exported from Echoview for a single survey and automatically crops and divides the cruise track as individual transects based on the bounds of a user-specified spatial extent ("dist"). Cropped paths are then exported for the purpose of defining the buffer to spatially subset the multibeam data in Step4.
+
+Full cruise track for a single site survey should be exported from Echoview as one file
+
+Required input files:
+
+-Exported cruise track, encompassing the entirety a single site survey, conatined within the directory path labeled "path_track"
+-Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
+
+Created by: Matthew Holland
+Email: m.holland@unsw.edu.au
+Date: 18 Sept 2020
+```{r}
+#clear global environment
+rm(list = ls())
+
+#user inputs
+reef <- "JDN" #specify site name designation in the filename
+day <- 8 #specify day of the month the survey took place
+month <- 11 #specify month the survey took place
+year <- 2019 #specify year the survey took place
+dist <- 300 #specify the width of the square survey extent in metres
+zone <- 56 #specify UTM grid zone for the site location
+hem <- "S" #specify hemisphere the survey was conducted in ("N" or "S")
+path_track <- "../Data/Track_exports/" #specify the file directory path for the cruise track GPS waypoints
+path_sites <- "../Data/Sites.csv" #specify the file directory path for the site coordinates
+```
+Load packages and relevant data
+```{r}
+#Check if all required packages are installed. Install them if they are not present. Then load required packages
+list.of.packages <- c("ggplot2", "sp", "dplyr")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+
+#turn off scientific notation
+options(scipen=999)
+ 
+#create a string for folder selection for the date specified
+day <- ifelse(nchar(day)<2, paste(0,day,sep=""), day)
+month <- ifelse(nchar(month)<2, paste(0,month,sep=""), month)
+date <- paste(year,month,day,sep="")
+
+#define CRS for projection
+crs_longlat <- paste("+proj=longlat +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", sep="")
+crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", " +zone=", zone, sep="")
+
+#load GPS coordinates of the site centroids
+df.reef <- read.csv(path_sites)
+
+#read in and tidy track data
+track.files <- list.files(paste(path_track, date,"/", reef, "/", sep=""), full.names = T)
+track.files <- subset(track.files, !grepl("processed", track.files)) #exclude the output files if this track has already been processed
+df.tracks <- read.csv(track.files,header=TRUE,sep=",")
+df.tracks <- dplyr::rename(df.tracks, GPS_fix = 1)
+
+#transform site centroid data as UTM
+df.reef$Est <- df.reef$Longitude
+df.reef$Nrt <- df.reef$Latitude
+coordinates(df.reef) <- ~ Est + Nrt
+proj4string(df.reef) <- CRS(crs_longlat)
+df.reef <- spTransform(df.reef, CRS(crs_utm))
+df.reef <- as.data.frame(df.reef)
+
+#project cruise track as UTM and convert to orthagonal coordinates
+df.tracks$Est <- df.tracks$Longitude
+df.tracks$Nrt <- df.tracks$Latitude
+coordinates(df.tracks) <- ~ Est + Nrt
+proj4string(df.tracks) <- CRS(crs_longlat)
+df.tracks <- spTransform(df.tracks, CRS(crs_utm))
+df.tracks <- as.data.frame(df.tracks)
+
+#make site centroid the origin for the coordinates of the track
+df.tracks$x <- df.tracks$Est - df.reef$Est[df.reef$Code==reef]
+df.tracks$y <- df.tracks$Nrt - df.reef$Nrt[df.reef$Code==reef]
+
+#subset track to the extent of a buffer to remove any irrelevant data not associated with the site survey
+buff <- dist*1.25 #define bounding box buffer
+df.tracks <- subset(df.tracks, x >= -1*dist-buff & x <= 1*dist+buff & y >= -1*dist-buff & y <= 1*dist+buff)
+
+#create colour palette for plotting the track
+jetcols <- c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000")
+
+#define colour scale limits for the track for reproducability later in code
+lims <- c(min(df.tracks$GPS_fix),max(df.tracks$GPS_fix))
+
+#define the boundaries of the spatial extent for plotting
+pts <- data.frame(x=c((-1)*(dist/2), (dist/2), (dist/2), (-1)*(dist/2), (-1)*(dist/2)), y=c((dist/2), (dist/2), (-1)*(dist/2), (-1)*(dist/2), (dist/2)))
+
+#plot the track and colour by sequence
+ggplot(data=df.tracks, aes(x=x, y=y, colour=GPS_fix))+
+  geom_point()+
+  coord_equal()+
+  scale_colour_gradientn(colours=jetcols, limits=lims)+
+  geom_path(data=pts, aes(x=x, y=y), inherit.aes = F)+
+  scale_x_continuous(name="x (m)")+
+  scale_y_continuous(name="y (m)")+
+  theme_bw()
+```
+Separate the tracks by a factor and remove unneeded data outside of the defined extent
+```{r}
+#use a factor to designate GPS points as either inside or outside the extent of the survey
+df.tracks$in_ext<-ifelse(abs(df.tracks$x)<=dist/2+dist*0.2 & abs(df.tracks$y)<=dist/2+dist*0.2, T, F)
+df.tracks$track <- as.factor(cumsum(c(1,as.numeric(diff(df.tracks$in_ext))!=0)))
+
+#recode factor to exclude the turns between transects
+df.tracks <- subset(df.tracks, in_ext==T)
+df.tracks$track <- factor(df.tracks$track)
+df.tracks$track <- factor(df.tracks$track, labels=seq(1,length(levels(df.tracks$track))))
+
+#plot the track and colour by sequence
+ggplot(data=df.tracks, aes(x=x, y=y, colour=track))+
+  geom_point()+
+  coord_equal()+
+  geom_path(data=pts, aes(x=x, y=y), inherit.aes = F)+
+  scale_x_continuous(name="x (m)")+
+  scale_y_continuous(name="y (m)")+
+  theme_bw()
+```
+Save tracks for later use in code for deriving school thickness
+```{r}
+#in an iterative manner, save the tracks as separate files in a folder
+for(track in levels(df.tracks$track)){
+  temp <- subset(df.tracks, track == track)
+  out.file <- paste(path_track, date,"/", reef, "/", reef, "-", track, "-processed",".csv", sep="")
+  write.csv(temp, out.file, row.names=F)
+}
+
+```
+
+
+
+

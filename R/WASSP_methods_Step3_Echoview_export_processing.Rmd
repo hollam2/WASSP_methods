@@ -1,0 +1,177 @@
+This script imports a set of georeferenced samples isolated and exported from Echoview for a single transect and allows the user to view the data in 3D to ensure it is free of errors. The script also adjusts the depth of the data based on the transducer offset below the water surface. This is mainly a quality control step. This is done on a transect by transect basis, iterated in a for loop. This script must be run before running the Step4 script, which combines transects into a single output for one survey.
+
+Required input files:
+
+-Exported xyz georeferenced samples isolated from multibeam data for a single transect, from Echoview or similar software, contained within the directory path labeled "path_samples"
+-Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
+-Site bathymetry gridded xyz data for the site in csv format, contained within the directory path labeled "path_bath". This data is generated using the Step1 script.
+
+Created by: Matthew Holland
+Email: m.holland@unsw.edu.au
+Date: 18 Sept 2020
+```{r}
+#clear global environment
+rm(list = ls())
+
+#user inputs
+reef <- "JDN" #specify site name designation in the filename
+day <- 8 #specify day of the month the survey took place
+month <- 11 #specify month the survey took place
+year <- 2019 #specify year the survey took place
+dist <- 300 #specify the width of the square survey extent in metres
+zone <- 56 #specify UTM grid zone for the site location
+hem <- "S" #specify hemisphere the survey was conducted in ("N" or "S")
+offset <- 1.5 #depth of transducer below water surface (in m)
+path_samples <- "../Data/3D_samples_exports/" #specify the file directory path for the 3D samples
+path_sites <- "../Data/Sites.csv" #specify the file directory path for the site coordinates
+path_bath <- "../Data/Bathymetry_exports/" #specify the file directory path for the bathymetry xyz csv
+```
+Load packages and relevant data
+```{r}
+#check if all required packages are installed. Install them if they are not present. Then load required packages
+list.of.packages <- c("sp", "rgl", "knitr", "stringr", "dplyr", "reshape2", "raster")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+
+#turn off scientific notation
+options(scipen=999)
+ 
+#create a string for folder selection for the date specified
+day <- ifelse(nchar(day)<2, paste(0,day,sep=""), day)
+month <- ifelse(nchar(month)<2, paste(0,month,sep=""), month)
+date <- paste(year,month,day,sep="")
+
+#define CRS for projection
+crs_longlat <- paste("+proj=longlat +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", sep="")
+crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", " +zone=", zone, sep="")
+
+#read in reef coordinate data for determining range limits
+df.reef <- read.csv(file=path_sites)
+
+#read in bathymetry xyz
+bath.files <- list.files(paste(path_bath, sep=""), full.names = T)
+bath.files <- subset(bath.files, grepl(as.character(reef), bath.files) & grepl("UTM", bath.files) & grepl("modified", bath.files)) 
+df.bath <- read.csv(bath.files[1])
+
+#adjust bathymetry for transducer depth offset
+df.bath$z <- df.bath$z - offset
+
+#convert bathymetry to raster
+coordinates(df.bath) <- ~ x + y
+gridded(df.bath) <- TRUE
+df.bath <- raster(df.bath)
+
+#exclude the output files if this transect has already been processed or is not the transect of interest and read in and clean data
+numextract <- function(string){str_extract(string, "\\-*\\d+\\.*\\d*")} #function for extracting number from string
+ev.files <- list.files(paste(path_samples, date,"/", reef, "/", sep=""), full.names = T) #read in the path for the data file
+ev.files <- subset(ev.files, !grepl("processed", ev.files))
+```
+Loop over multiple transects, plot in 3D and output cleaned versions 
+```{r}
+#for loop to iterate over multiple transects in the same survey
+for(i in 1:length(unique(ev.files))){
+  
+#subset file list to transect of interest  
+ev.files.sub <- subset(ev.files, abs(as.numeric(numextract(gsub(".*/|\\.[^.]+$", "", ev.files))))==i) 
+
+#read in the processed multibeam output file
+df <- read.csv(ev.files.sub)
+df <- subset(df, Sv > -999)
+df <- dplyr::rename(df, Ping_index = 1)
+
+#re-project georeferenced data as UTM
+df$Est <- df$Longitude
+df$Nrt <- df$Latitude
+coordinates(df) <- ~ Est + Nrt
+proj4string(df) <- CRS(crs_longlat)
+df <- spTransform(df, CRS(crs_utm))
+
+#adjust samples for transducer depth offset
+df$Altitude <- df$Altitude - offset
+df$Depth <- df$Depth + offset
+
+#exclude all below-bottom samples and within extent of survey area
+df$bot.dep <- raster::extract(df.bath, df)*(-1) #extract bottom depth
+df <- subset(df, Depth < bot.dep - 1) #subset schools data by bottom depth
+df <- as.data.frame(df)
+
+#convert reef centroid data to UTM for subsetting
+df.reef$Est <- df.reef$Longitude
+df.reef$Nrt <- df.reef$Latitude
+coordinates(df.reef) <- ~ Est + Nrt
+proj4string(df.reef) <- CRS(crs_longlat)
+df.reef <- spTransform(df.reef, CRS(crs_utm))
+df.reef <- as.data.frame(df.reef)
+
+#make reef origin for georeferenced points and then subset by spatial extent
+df$x <- df$Est - df.reef$Est[df.reef$Code==reef]
+df$y <- df$Nrt - df.reef$Nrt[df.reef$Code==reef]
+df <- subset(df, abs(x) <= dist/2 & abs(y) <= dist/2) #subset schools data by survey area extent
+
+#remove first ping (necessary sometimes if data is not subset properly by Echoview)
+df <- subset(df, Ping_index != min(df$Ping_index))
+
+#Plot in 3D using the RGL package
+#generate three-column matrix from DEM
+dem <- as.data.frame(df.bath, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+dem <- data.frame(x=dem$x, y=dem$y, z=dem$z)
+
+#convert to xy coordinates
+dem$x <- dem$x - df.reef$Est[df.reef$Code==reef]
+dem$y <- dem$y - df.reef$Nrt[df.reef$Code==reef]
+
+#subset to extent of bounding box
+dem <- subset(dem, abs(x) < dist/2 & abs(y) < dist/2)
+
+#ensure no NA rows
+dem <- dem[complete.cases(dem), ]
+
+#reshape data into an x~y matrix of bathymetry values 
+r.dem <- reshape2::acast(dem, x~y, value.var="z")
+
+#calculate reduction factor for z axis to keep coordinates equal
+rdctn <- (abs(abs(min(dem$z)) - abs(max(dem$z)))) / (2*dist)
+
+#specify a multiplier for z-axis to accentuate vertical relief (default is 1 for real scale)
+mltp <- 2
+
+#create scaled dataframe of samples for plotting
+df.plot <- df
+df.plot$x <- (df.plot$x + dist/2)/dist
+df.plot$y <- (df.plot$y + dist/2)/dist
+
+#generate axis label vectors for 3D plotting
+ylabs <- round(seq(from = 1, to = (length(rownames(r.dem))), length=12))
+xlabs <- round(seq(from = 1, to = (length(colnames(r.dem))), length=12))
+
+#3D plotting with RGL
+knit_hooks$set(webgl = hook_webgl)
+nbcol = 100
+color=terrain.colors(100)
+zcol  = cut(r.dem, nbcol)
+persp3d(r.dem, col=color[zcol],clab = "m",shade = 0.1,aspect=c(1,1,rdctn*mltp), axes=FALSE, xlab="x", ylab="y")
+axis3d("x", at=seq(0,1, length = length(colnames(r.dem)[xlabs])), labels=round(as.numeric(colnames(r.dem)[xlabs])), box=TRUE, pos=c(0,1,round(min(r.dem))))
+axis3d("x", at=seq(0,1, length = length(colnames(r.dem)[xlabs])), labels=round(as.numeric(colnames(r.dem)[xlabs])), box=TRUE, pos=c(0,0,round(min(r.dem))))
+
+axis3d("y", at=seq(0,1, length = length(rownames(r.dem)[ylabs])), labels = round(as.numeric(rownames(r.dem)[ylabs])), box=TRUE, pos=c(0,0,round(min(r.dem))))
+axis3d("y", at=seq(0,1, length = length(rownames(r.dem)[ylabs])), labels = round(as.numeric(rownames(r.dem)[ylabs])), box=TRUE, pos=c(1,0,round(min(r.dem))))
+
+axis3d("z", at=round(seq(min(r.dem),0, length = 8)), labels=round(seq(min(r.dem),0, length = 8)), box=TRUE, pos=c(1,0,0))
+axis3d("z", at=round(seq(min(r.dem),0, length = 8)), labels=round(seq(min(r.dem),0, length = 8)), box=TRUE, pos=c(0,1,0))
+axis3d("z", at=round(seq(min(r.dem),0, length = 8)), labels=round(seq(min(r.dem),0, length = 8)), box=TRUE, pos=c(1,1,0))
+axis3d("z", at=round(seq(min(r.dem),0, length = 8)), labels=round(seq(min(r.dem),0, length = 8)), box=TRUE, pos=c(0,0,0))
+
+box3d()
+
+nbcol = 100
+color = rev(rainbow(nbcol, start = 0/6, end = 4/6))
+zcol  = cut(df.plot$Sv, nbcol)
+points3d(x=df.plot$x, y=df.plot$y, z=df.plot$Altitude, col=color[zcol])
+
+#Save the processed acoustic data
+write.csv(df, file=paste(path_samples, date,"/", reef, "/", reef, "-", i, "-processed", ".mb.points.csv", sep=""), row.names=F)
+
+}
+```
+

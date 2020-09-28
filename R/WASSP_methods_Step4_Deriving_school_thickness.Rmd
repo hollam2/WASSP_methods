@@ -1,0 +1,345 @@
+This script imports a set of cleaned transect samples isolated and exported from Echoview and processed in R with the Step2 script. It processes the 3D xyz georeferenced target data for a single survey and writes it into a dataframe on a transect by transect basis. 
+
+Required input files:
+
+-A full set of 3D xyz exported georeferenced samples isolated from multibeam data for a single survey, from Step3 script, contained within the directory path labeled "path_samples"
+-Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
+-Site bathymetry gridded xyz data for the site in csv format, from Step1 script, contained within the directory path labeled "path_bath"
+-Cruise track GPS data processed by Step2 script, contained within the directory path labeled "path_tracks"
+
+Created by: Matthew Holland
+Email: m.holland@unsw.edu.au
+Date: 21 Sept 2020
+```{r}
+#clear global environment
+rm(list = ls())
+
+#user inputs
+reef <- "JDN" #specify site name designation in the filename
+day <- 8 #specify day of the month the survey took place
+month <- 11 #specify month the survey took place
+year <- 2019 #specify year the survey took place
+dist <- 300 #specify the width of the square survey extent in metres
+zone <- 56 #specify UTM grid zone for the site location
+hem <- "S" #specify hemisphere the survey was conducted in ("N" or "S")
+offset <- 1.5 #depth of transducer below water surface (in m)
+path_samples <- "../Data/3D_samples_exports/" #specify the file directory path for the GPS waypoints
+path_sites <- "../Data/Sites.csv" #specify the file directory path for the site coordinates
+path_bath <- "../Data/Bathymetry_exports/" #specify the file directory path for the bathymetry xyz csv
+path_tracks <- "../Data/Track_exports/" #specify the file directory path for the cruise track GPS waypoints
+path_export <- "../Data/School_thickness_exports/" #specify the file directory path for the exported school thickess for the survey
+sch.cell <- 1 #specify the resolution at which school thickness will be initially rasterised
+agg.cell <- 5 #specify primary grid cell size for environmental variable detection in m and for the resolution of the aggregated school thickness rasters
+mindep <- 10 #specify minimum depth below transducer that all shallower targets will be cropped to
+swath <- 120 #specify multibeam echosounder swath width in degrees
+```
+Load packages and relevant data
+```{r}
+#check if all required packages are installed. Install them if they are not present. Then load required packages
+list.of.packages <- c("sp", "ggplot2", "raster", "dplyr", "reshape2", "pracma", "rgeos", "maptools", "stringr", "rgl", "tidyr")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+
+#turn off scientific notation
+options(scipen=999)
+
+#create a string for folder selection for the date specified
+day <- ifelse(nchar(day)<2, paste(0,day,sep=""), day)
+month <- ifelse(nchar(month)<2, paste(0,month,sep=""), month)
+date <- paste(year,month,day,sep="")
+
+#define CRS for projection
+crs_longlat <- paste("+proj=longlat +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", sep="")
+crs_utm <- paste("+proj=utm +ellps=WGS84 +south=", ifelse(hem=="S", "T", "F"), " +datum=WGS84", " +zone=", zone, sep="")
+
+#create a list of the relevant 3D samples files to load
+file_list <- list.files(paste(path_samples, date,"/", reef, "/", sep=""), full.names = T) #read in the path for the data file
+file_list <- subset(file_list, grepl("processed", file_list)) #exclude unprocessed data
+
+#load in the relevant pre-processed 3D samples from Step2 for a single survey - this step can be slow
+numextract <- function(string){str_extract(string, "\\-*\\d+\\.*\\d*")} #function for extracting number from string
+df=NULL
+for (file in file_list){
+  x <- read.csv(paste(file), header=TRUE, sep=",")
+  x$trans.num <- abs(as.numeric(numextract(gsub(".*/|\\.[^.]+$", "", file))))
+  df=rbind(df,x)
+  rm(x)
+}
+
+#subset schools by bounding box of area
+df <- subset(df, abs(x) <= dist/2 & abs(y) <= dist/2)
+```
+Read in reef site info in order to inform subsetting of boundary area and generate orthogonal coordinates
+```{r}
+#read in reef coordinate data for determining range limits
+df.reef <- read.csv(file=path_sites)
+
+#convert reef centroid data to UTM for subsetting
+df.reef$Est <- df.reef$Longitude
+df.reef$Nrt <- df.reef$Latitude
+coordinates(df.reef) <- ~ Est + Nrt
+proj4string(df.reef) <- CRS(crs_longlat)
+df.reef <- spTransform(df.reef, CRS(crs_utm))
+df.reef <- as.data.frame(df.reef)
+```
+Read in and manipulate bathymetry xyz data
+```{r}
+bath.files <- list.files(paste(path_bath, sep=""), full.names = T)
+bath.files <- subset(bath.files, grepl(as.character(reef), bath.files) & grepl("base", bath.files)) 
+df.bath <- read.csv(bath.files[1])
+df.bath <- dplyr::rename(df.bath, Est = x, Nrt = y)
+
+#include transducer depth offset in bathymetry
+df.bath$z <- df.bath$z - offset
+
+#make reef origin for points
+df.bath$x <- df.bath$Est - df.reef$Est[df.reef$Code == reef]
+df.bath$y <- df.bath$Nrt - df.reef$Nrt[df.reef$Code == reef]
+
+#define coordinates
+coordinates(df.bath) <- ~ x + y
+
+#define raster
+buf <- 1 #define the number of buffer cells around each side of the survey extent
+r.base <- raster(ncols=dist/agg.cell+buf*2, nrows=dist/agg.cell+buf*2, xmn=(-1)*dist/2-agg.cell*buf, xmx=dist/2+agg.cell*buf, ymn=(-1)*dist/2-agg.cell*buf, ymx=dist/2+agg.cell*buf)
+
+#rasterise bathymetry
+r.bath <- rasterize(df.bath, r.base, field = df.bath$z, update = TRUE)
+
+#convert raster bathymetry to a dataframe and overwrite df.bath
+df.bath <- as.data.frame(r.bath, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+df.bath <- dplyr::rename(df.bath, z = layer)
+
+#plot the bathymetry
+ggplot(df.bath, aes(x,y,fill=z))+
+  geom_raster()+
+  coord_equal()+
+  theme_bw()+
+  scale_x_continuous(expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  scale_fill_gradientn(colours = terrain.colors(10))
+```
+3D plotting for visual inspection of all the data from a single survey
+```{r}
+dem <- df.bath #make matrix from DEM
+dem <- subset(dem, abs(x) <= dist/2 & abs(y) <= dist/2) #subset to bounding box extent
+dem <- dem[complete.cases(dem), ] #ensure no NA rows
+r.dem <- reshape2::acast(dem, x~y, value.var="z") #reshape dataframe to matrix
+
+#calculate reduction factor for z axis to keep coordinates equal
+rdctn <- (abs(abs(min(dem$z)) - abs(max(dem$z)))) / (2*dist)
+
+#specify a multiplier for z-axis (default is 1 for real scale)
+mltp <- 2
+
+#create scaled dataframe of samples for plotting
+df.plot <- df
+df.plot$x <- (df.plot$x + dist/2)/dist
+df.plot$y <- (df.plot$y + dist/2)/dist
+
+#generate axis label vectors for 3D plotting
+ylabs <- round(seq(from = 1, to = (length(rownames(r.dem))), length=12))
+xlabs <- round(seq(from = 1, to = (length(colnames(r.dem))), length=12))
+
+#3D plotting
+knit_hooks$set(webgl = hook_webgl)
+nbcol = 100
+#color = rev(rainbow(nbcol, start = 0/6, end = 4/6))
+color=terrain.colors(100)
+zcol  = cut(r.dem, nbcol)
+persp3d(r.dem, col=color[zcol],clab = "m",shade = 0.1,aspect=c(1,1,rdctn*mltp), axes=FALSE, xlab="x", ylab="y")
+axis3d("x", at=seq(0,1, length = length(colnames(r.dem)[xlabs])), labels=colnames(r.dem)[xlabs], box=TRUE)
+axis3d("y", at=seq(0,1, length = length(rownames(r.dem)[ylabs])), labels = rownames(r.dem)[ylabs], box=TRUE)
+axis3d("z", at=round(seq(min(r.dem),0, length = 8)), labels=round(seq(min(r.dem),0, length = 8)), box=TRUE)
+box3d()
+
+#plot points (schools)
+nbcol = 100
+color = rev(rainbow(nbcol, start = 0/6, end = 4/6))
+zcol  = cut(df.plot$Sv, nbcol)
+points3d(x=df.plot$x, y=df.plot$y, z=df.plot$Altitude, col=color[zcol],aspect=c(1,1,mltp))
+```
+Prepare 3D samples dataframe and base raster for spatial subsetting and rasterization of school distribution data
+```{r}
+#subset by minimum depth
+df <- subset(df, Depth > mindep)
+
+#define coordinates for schools
+coordinates(df) <- ~ x + y
+
+#extract bottom depth
+df$bot.dep <- raster::extract(r.bath, df)*(-1)
+
+#subset schools data by bottom depth
+df <- subset(df, Depth < bot.dep - 1)
+```
+Load in track files and buffer around them based on depth and trigonometry on a per point basis to reveal surveyed versus unsurveyed sections
+```{r}
+#read list of filenames for processed cruise track files
+track.files <- list.files(paste(path_tracks, date,"/", reef, "/", sep=""), full.names = T)
+track.files <- subset(track.files, grepl("processed", track.files)) #exclude the input files if this track has not been processed
+
+#sequentially read in cruise track files for the specified survey
+df.tracks=NULL
+for (track in track.files){
+  x <- read.csv(track, header=TRUE, sep=",")
+  df.tracks=rbind(df.tracks,x)  
+}
+
+#plot he tracks as they have been read in
+ggplot(df.tracks, aes(x, y, colour=as.factor(track)))+
+  geom_point()+
+  coord_equal()+
+  theme_bw()
+
+#extract bottom depth at each point along the cruise track
+coordinates(df.tracks) <- ~ x + y
+df.tracks$depth <- raster::extract(r.bath, df.tracks)
+
+#calculate mean depth of the track for working out swath width with trig and 120 degree beam
+df.tracks$buff.wid <- abs(mindep)*tand(120/2)
+
+#reduce the size of the dataframe by extracting every 50th row
+df.tracks <- df.tracks[seq(1, nrow(df.tracks), 50), ]
+
+#generate polygons from buffering around the cruise track
+spList = vector("list", length(df.tracks))
+for (i in 1:length(df.tracks)) {
+  a <- rgeos::gBuffer(df.tracks[i,], width = (df.tracks$buff.wid[i]))
+  a$id = df.tracks$track[i]
+  spList[[i]] <- a
+}
+spListAll <- do.call("rbind", spList)
+
+#merge polygons within transects and plot for visual inspection
+spListAll <- maptools::unionSpatialPolygons(spListAll, spListAll$id)
+plot(spListAll)
+
+#create spatial p[olygons data frame
+df.buff <- SpatialPolygonsDataFrame(Sr=spListAll, data=data.frame(id=1:length(unique(spListAll@polygons))),FALSE)
+
+```
+Rasterise 3D school thickness data initially, then min, then max depth
+```{r}
+#create base raster grid
+r.base <- raster(ncols = dist/sch.cell, nrows = dist/sch.cell, xmn=(-1)*dist/2, xmx=dist/2, ymn=(-1)*dist/2, ymx=dist/2)
+
+#bin depth by 1 m bins
+df$depth.bin <- cut(df$Depth, breaks=seq(0,1000,1), labels=seq(0.5, 999.5, 1))
+
+#list unique transects
+sch.num <- unique(df$trans.num)
+
+#define empty raster stacks
+vol.rast <- stack()
+min.rast <- stack()
+max.rast <- stack()
+
+#rasterise schools on a transect by transect basis - this step can be slow
+for (sch in sch.num){
+  
+  #subset 3D data by transect
+  sch.subset <- subset(df, trans.num == sch)
+  
+  #rasterize using the sum method
+  a <- rasterize(sch.subset, r.base, field = sch.subset$depth.bin, fun=function(x,...) {length(unique(x))}) 
+  b <- rasterize(sch.subset, r.base, field = sch.subset$Depth, fun=function(x,...) {min(x, na.rm=T)}) 
+  c <- rasterize(sch.subset, r.base, field = sch.subset$Depth, fun=function(x,...) {max(x, na.rm=T)}) 
+  
+  #subset buffer SPDF to correct buffer and rasterize buffer
+  buff.subset <- subset(df.buff, id == sch)
+  buff.subset <- rasterize(buff.subset, r.base)
+
+  #assign 0 to NA cells in school thickness transect
+  a[is.na(a)] <- 0
+  
+  #then crop transect by buffer
+  a[is.na(buff.subset)] <- NA
+  b[is.na(buff.subset)] <- NA
+  c[is.na(buff.subset)] <- NA
+
+  #combine rasters into raster stacks
+  vol.rast <- stack(vol.rast, a)
+  min.rast <- stack(min.rast, b)
+  max.rast <- stack(max.rast, c)
+   
+}
+
+#rename rasters in stacks to correspond with transects
+names(vol.rast) <- as.numeric(unique(df$trans.num))
+names(min.rast) <- as.numeric(unique(df$trans.num))
+names(max.rast) <- as.numeric(unique(df$trans.num))
+
+#plot the raster stacks
+plot(vol.rast)
+plot(min.rast)
+plot(max.rast)
+
+#create dataframes from the stacks
+vol.rast.2D <- as.data.frame(vol.rast, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+min.rast.2D <- as.data.frame(min.rast, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+max.rast.2D <- as.data.frame(max.rast, row.names=NULL, optional=FALSE, xy=TRUE, na.rm=FALSE, long=FALSE)
+
+#save transect by transect version for raster analysis
+vol.rast.2D <- tidyr::gather(vol.rast.2D, trans, vol, 3:ncol(vol.rast.2D))
+min.rast.2D <- tidyr::gather(min.rast.2D, trans, min, 3:ncol(min.rast.2D))
+max.rast.2D <- tidyr::gather(max.rast.2D, trans, max, 3:ncol(max.rast.2D))
+
+#create final combined dataframe
+rast.2D <- cbind(vol.rast.2D, min=min.rast.2D$min, max=max.rast.2D$max)
+rm(vol.rast.2D, min.rast.2D, max.rast.2D)
+
+#rename transects (remove the X associated with the raster stack names)
+rast.2D$trans <- gsub("X", "", rast.2D$trans)
+
+#add bathymetry to the dataframe as a variable
+coordinates(rast.2D) <- ~ x + y
+rast.2D$bath <- raster::extract(r.bath, rast.2D)*(-1)
+rast.2D <- as.data.frame(rast.2D)
+```
+Plot the three rasterized variables
+```{r}
+#define colour palette
+jetcols <- c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000")
+
+#plot volume (thickness)
+ggplot()+
+geom_tile(data=subset(rast.2D,!(is.na(vol))), aes(x=x, y=y, fill=vol))+
+coord_equal()+
+scale_fill_gradientn(colours=jetcols)+
+scale_x_continuous(expand=c(0,0))+
+scale_y_continuous(expand=c(0,0))+
+theme_bw()
+
+#plot min depth
+ggplot()+
+geom_tile(data=subset(rast.2D,!(is.na(vol))), aes(x=x, y=y, fill=min))+
+coord_equal()+
+scale_fill_gradientn(colours=jetcols)+
+scale_x_continuous(expand=c(0,0))+
+scale_y_continuous(expand=c(0,0))+
+theme_bw()
+
+#plot max depth
+ggplot()+
+geom_tile(data=subset(rast.2D,!(is.na(vol))), aes(x=x, y=y, fill=max))+
+coord_equal()+
+scale_fill_gradientn(colours=jetcols)+
+scale_x_continuous(expand=c(0,0))+
+scale_y_continuous(expand=c(0,0))+
+theme_bw()
+```
+Prepare transect dataframe to be saved so that it can be used in another script
+```{r}
+#add in date and site as variables in dataframe
+rast.2D$date <- paste(day, month, year, sep="-")
+rast.2D$site <- reef
+
+#remove all NA (unsurveyed) cells to save on file size
+rast.2D <- subset(rast.2D, !(is.na(rast.2D$vol)))
+
+#save data as .csv file
+Filename <- "trans-grid-df"
+write.csv(rast.2D, file=paste(path_export, Filename, "-", reef, "-", rast.2D$date[1], ".csv",sep=""), row.names=F)
+```
