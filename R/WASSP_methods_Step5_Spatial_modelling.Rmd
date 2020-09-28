@@ -7,7 +7,7 @@ Required input files:
 -Site bathymetry gridded xyz data for the site in csv format, from Step1 script, contained within the directory path labeled "path_bath"
 -A shapefile containing the GPS coordinates of artificial objects, contained within the directory labelled "path_shape"
 
-The data necessary to run this script is available from: https://rds.unsw.edu.au/mflux/content.mfjp?_skey=V4exP9Sf5shcm9EMLKFsZ9pYQgGYOo98/2c7/e92a7a&id=495206927&version=1 (https://bit.ly/3mYJBLN) 
+The data necessary to run this script is available from: https://bit.ly/3mYJBLN (https://rds.unsw.edu.au/mflux/content.mfjp?_skey=V4exP9Sf5shcm9EMLKFsZ9pYQgGYOo98/2c7/e92a7a&id=495206927&version=1).
 
 Created by: Matthew Holland
 Email: m.holland@unsw.edu.au
