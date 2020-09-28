@@ -80,6 +80,11 @@ df <- read.table(unzip(ev.files.sub, exdir=paste(path_samples, date,"/", reef, s
 df <- subset(df, Sv > -999)
 df <- dplyr::rename(df, Ping_index = 1)
 
+#remove the unzipped file from storage now that it is in the R environment
+del.files <- list.files(paste(path_samples, date,"/", reef, "/", sep=""), full.names = T) #read in the path for the data file
+del.files <- subset(del.files, !grepl("processed", del.files) & grepl(".csv", del.files) & !grepl("readme", del.files) & abs(as.numeric(numextract(gsub(".*/|\\.[^.]+$", "", del.files))))==i)
+file.remove(del.files)
+
 #re-project georeferenced data as UTM
 df$Est <- df$Longitude
 df$Nrt <- df$Latitude
