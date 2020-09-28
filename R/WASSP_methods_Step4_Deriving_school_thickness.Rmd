@@ -7,6 +7,8 @@ Required input files:
 -Site bathymetry gridded xyz data for the site in csv format, from Step1 script, contained within the directory path labeled "path_bath"
 -Cruise track GPS data processed by Step2 script, contained within the directory path labeled "path_tracks"
 
+The data necessary to run this script is available from: https://rds.unsw.edu.au/mflux/content.mfjp?_skey=V4exP9Sf5shcm9EMLKFsZ9pYQgGYOo98/2c7/e92a7a&id=495206927&version=1 (https://bit.ly/3mYJBLN) 
+
 Created by: Matthew Holland
 Email: m.holland@unsw.edu.au
 Date: 21 Sept 2020
