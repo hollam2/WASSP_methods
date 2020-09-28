@@ -7,8 +7,6 @@ Required input files:
 -Exported cruise track, encompassing the entirety a single site survey, conatined within the directory path labeled "path_track"
 -Survey site location with site centroid GPS coordinates, contained within the directory path labeled "path_sites"
 
-The data necessary to run this script is available from: https://bit.ly/3mYJBLN (https://rds.unsw.edu.au/mflux/content.mfjp?_skey=V4exP9Sf5shcm9EMLKFsZ9pYQgGYOo98/2c7/e92a7a&id=495206927&version=1).
-
 Created by: Matthew Holland
 Email: m.holland@unsw.edu.au
 Date: 18 Sept 2020
